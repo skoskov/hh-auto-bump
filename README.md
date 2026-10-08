@@ -1,49 +1,111 @@
 # HH auto bump
 
-Local Playwright browser, based on the existing profi-bot approach.
-Uses a separate Chrome profile in `.state/profile`; no HH developer application,
-API keys, browser extension, cookie extraction or password in source code.
+Local Playwright bot for the visible HH website. It uses installed Google Chrome
+and its dedicated `.state/profile` directory. Passwords, cookies and browser
+storage are not extracted; credentials and CAPTCHA are entered manually.
 
-Runtime currently reused from `../profi-bot/.venv/Scripts/python.exe`.
-Run `hh_bump.py login` once to sign in yourself in the dedicated browser window.
-The profile is saved locally and must not be shared. If `run` finds an expired
-session, it keeps headed Chrome open on HH's phone/email login page for up to
-30 minutes. Sign in manually in that window; once the resume cards return, the
-same run continues only if at least one resume identifier matches the prior local
-`inspection.json`. A different account is logged as `auth_account_mismatch` and
-the run exits safely. The event log also records `auth_required`, `auth_restored`,
-or `auth_timeout` (with `reason=browser_closed` if Chrome closes). Credentials are
-never automated.
+## Installation and normal launch
 
-Commands: `login` (manual sign-in), `inspect` (local DOM summary), `check`
-(read-only check of each eligible control), `run` (raise eligible resumes).
-Only the observed `resume-update-button` control with exact normalized caption
-is clicked, inside an ancestor with exactly one resume link. Each disappearance
-is checked, then the page is reloaded to confirm no eligible buttons remain.
-Successful runs are separated by at least four hours and one minute.
-No text, visibility settings or paid services are changed.
+Python 3.11+ and installed Google Chrome are required. The project owns its
+`.venv`; no runtime dependency on another project's environment remains.
 
-Run `powershell -ExecutionPolicy Bypass -File .\install-schedule.ps1` to create
-the Windows task after a successful live run. It requires an interactive Windows
-login and resumes a missed trigger when the computer becomes available. To apply
-an updated script/settings to the existing task, run
-`powershell -ExecutionPolicy Bypass -File .\install-schedule.ps1 -Update` from
-this directory. The update path changes the existing task in place only after
-confirming its sole action is the expected Python executable and this
-`hh_bump.py run` script; it does not create a replacement or duplicate. If that
-check fails, inspect the task in Task Scheduler before taking further action.
-Turn it off using Task Scheduler: `HH-Resume-AutoBump` -> Disable.
-Errors and counts are in `.state/events.jsonl`; login/captcha requires manual
-attention. Do not share the profile directory. Updates to HH may require
-updating the DOM selectors. Python currently depends on the Profi-bot venv.
+```powershell
+.\setup.ps1
+.\run-scheduled.ps1
+```
 
-Implementation note: model-route is available and its policy was checked.
-The 2026-09-25 auth-recovery implementation used the configured fix role and
-received an independent static review. `model-route verify` returned UNVERIFIED
-because the spawned session metadata did not contain the required `agent_path`;
-the routing verifier failure is recorded rather than treated as a pass.
-The reported stable-target click issue was fixed using the original element handle.
-Initial read-only verification found 14 eligible controls for 14 resumes.
-Live verification on 2026-09-09 confirmed all 14 raised across recovery runs,
-with zero eligible controls after reload. The optional Setka promotion is declined
-using its observed 'Потом' button; no cross-posting is accepted.
+If automatic Python discovery fails, supply a working interpreter:
+
+```powershell
+.\setup.ps1 -Python 'C:\path\to\python.exe'
+```
+
+The default launch keeps one visible Chrome context and tab open across cycles.
+Closing that window or stopping the console stops the service. Changes to Python
+files require restarting the existing process. A second manual invocation reports
+that the bot is already running (exit 3); it does not create another browser.
+
+```powershell
+.\run-scheduled.ps1 -Mode check       # inspect live card states; no resume bump
+.\run-scheduled.ps1 -Mode login       # initial sign-in/account baseline
+.\run-scheduled.ps1 -Mode run         # one due cycle, same due rules as service
+.\run-scheduled.ps1 -Mode inspect     # save bounded local resume control metadata
+.\.venv\Scripts\python.exe hh_bump.py --version
+```
+
+Known optional promotions and cookie notices may be dismissed during a check;
+checks do not raise resumes or choose paid actions. The expected account is
+verified by overlap with locally recorded resume IDs before each actionable
+cycle. Existing `inspection.json` is migrated as the baseline. A missing or
+mismatched baseline blocks actions; use explicit login to establish it.
+
+## How the service recovers
+
+The same card classifier is used before clicks, for confirmation and for final
+verification. Exact offered controls, cooldown labels (including labels that
+retain the old data-qa), visibility-restricted cards without a bump control, and
+unknown states are distinct. Visibility-restricted cards are skipped only when
+HH explicitly shows its exact "Make visible" control; visibility is not changed.
+Unknown is never success.
+Each send intent is atomically persisted before a click; confirmed and ambiguous
+results are saved per resume. An uncertain action is not automatically resent
+before its protective interval has expired and HH again offers the action.
+Other safely identified cards can still be processed after a local card error.
+Account changes, an unexpected host or an unknown blocking dialog stop the cycle.
+
+Successful cycles are separated by at least four hours and one minute. Temporary
+failures use bounded short retries; per-resume deadlines still prevent duplicate
+sends. Both `run` and `service` use `.state/runtime-state.json`. Old timestamp
+files are migrated. Invalid files are preserved with `.invalid-*` names once,
+and a durable conservative recovery deadline is saved instead of restarting the
+wait at each launch.
+
+Startup performs an account/card health check in the same tab, even when the next
+bump is not due. A fully successful check or run records its validation kind and
+the digest of all production Python modules, requirements and launcher. A check
+is evidence of current live selectors/account, not evidence of a live bump.
+Changing production inputs invalidates that release's verification. Tests use
+synthetic HTML and isolated browser contexts; they never visit HH.
+
+## Windows Task Scheduler
+
+After a successful current-release check or run:
+
+```powershell
+.\install-schedule.ps1             # create when absent
+.\install-schedule.ps1 -Update     # migrate the verified existing task
+```
+
+The installer verifies the expected account, task folder, executable and action.
+It refuses ambiguous task names, other owners, noninteractive logon and elevated
+run levels. Updates replace the former repeating trigger with a logon trigger.
+Only the service owns resume periodicity; Task Scheduler starts it when the user
+logs on and can restart a failed process up to three times at one-minute intervals.
+The process has no execution time limit; `IgnoreNew` prevents duplicate launches.
+No installation immediately starts a live cycle. Start the service manually once
+in the current desktop session. Scheduler failures never wait for keyboard input.
+
+After repeated failures, inspect status and failure artifacts. Automatic process
+restarts are bounded; after the supervisor's restart limit, manual intervention
+or the next logon is required. Authentication/CAPTCHA or a changed unknown HH
+interface can still require attention. User-closing Chrome exits normally and
+does not force an immediate reopening.
+
+## Diagnostics and tests
+
+- `.state/events.jsonl`: structured UTF-8 events, run ID, release digest and stage.
+- `.state/status.json`: stage, heartbeat, next due time and failure count.
+- `.state/console/`: one UTF-8 console log per invocation, consistent in PS 5/7.
+- `.state/failures/`: separate local metadata/screenshots for failures; no cookies,
+  passwords or browser storage. Screenshots can contain private resume information.
+
+Old `scheduled-console.log` remains historical and is not appended to. State,
+profile, diagnostics, temporary test output and `.venv` are excluded from Git.
+
+```powershell
+.\.venv\Scripts\python.exe -m unittest discover -s tests -v
+Get-Content .state\status.json -Encoding UTF8
+```
+
+No resume text/visibility or paid services are changed. Conversation export and
+cover-letter generation for favorites are planned for a separate next stage.
