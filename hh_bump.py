@@ -26,6 +26,7 @@ ROOT = Path(__file__).resolve().parent
 STATE = ROOT / ".state"
 URL = "https://ekaterinburg.hh.ru/applicant/profile/me"
 INTERVAL = 4 * 60 * 60 + 60
+DEFERRED = 4
 RUN_ID = uuid.uuid4().hex
 STAGE = "startup"
 CURRENT_STORE = None
@@ -310,30 +311,35 @@ def dismiss_promotion(page):
     visible_markers = visible_offers + visible_titles
     if visible_markers:
         record("promotion_detected", kind="setka")
-        choices = []
-        for label in ("Потом", "Позже", "Позднее"):
-            buttons = page.get_by_role("button", name=label, exact=True)
-            for index in range(buttons.count()):
-                button = buttons.nth(index)
-                if not button.is_visible() or not button.is_enabled(timeout=2000):
-                    continue
-                handle = button.element_handle()
-                if handle is not None and handle.evaluate("button => {" + MODAL_TEST_JS + """
-                    for (let node = button.parentElement; node && node !== document.body;
-                         node = node.parentElement) {
-                        const text = (node.innerText || '').replace(/\\s+/g, ' ').trim();
-                        const exactTitle = Array.from(node.querySelectorAll('*')).some(el =>
-                            (el.innerText || '').replace(/\\s+/g, ' ').trim() === 'Сетка' &&
-                            el.getClientRects().length > 0 &&
-                            window.getComputedStyle(el).visibility !== 'hidden');
-                        const buttons = node.querySelectorAll('button, [role="button"]');
-                        if ((text.includes('Разместим его в Сетке?') || exactTitle) && isModal(node) &&
-                            text.length <= 1200 && buttons.length >= 2 && buttons.length <= 4)
-                            return true;
-                    }
-                    return false;
-                }"""):
-                    choices.append(handle)
+        deadline = time.monotonic() + 3
+        while True:
+            choices = []
+            for label in ("Потом", "Позже", "Позднее"):
+                buttons = page.get_by_role("button", name=label, exact=True)
+                for index in range(buttons.count()):
+                    button = buttons.nth(index)
+                    if not button.is_visible() or not button.is_enabled(timeout=500):
+                        continue
+                    handle = button.element_handle()
+                    if handle is not None and handle.evaluate("button => {" + MODAL_TEST_JS + """
+                        for (let node = button.parentElement; node && node !== document.body;
+                             node = node.parentElement) {
+                            const text = (node.innerText || '').replace(/\\s+/g, ' ').trim();
+                            const exactTitle = Array.from(node.querySelectorAll('*')).some(el =>
+                                (el.innerText || '').replace(/\\s+/g, ' ').trim() === 'Сетка' &&
+                                el.getClientRects().length > 0 &&
+                                window.getComputedStyle(el).visibility !== 'hidden');
+                            const buttons = node.querySelectorAll('button, [role="button"]');
+                            if ((text.includes('Разместим его в Сетке?') || exactTitle) && isModal(node) &&
+                                text.length <= 1200 && buttons.length >= 2 && buttons.length <= 4)
+                                return true;
+                        }
+                        return false;
+                    }"""):
+                        choices.append(handle)
+            if choices or time.monotonic() >= deadline:
+                break
+            page.wait_for_timeout(200)
         if len(choices) != 1:
             record("unknown_dialog", kind="setka", later_controls=len(choices))
             raise RuntimeError("Setka offer has no unambiguous later choice")
@@ -637,6 +643,8 @@ def bump(page, *, dry_run=False):
     handle_dialogs(page, dismiss=not dry_run)
     eligible = 0
     changed = 0
+    attempted = set()
+    confirmed_during_cycle = set()
     unavailable = 0
     unresolved = []
     for key in keys:
@@ -673,9 +681,30 @@ def bump(page, *, dry_run=False):
         if not CURRENT_STORE.may_send(key):
             record("resume_quarantined", resume=key,
                    until=CURRENT_STORE.progress(key)["not_before"])
+            continue
+        # The trial performs Playwright's actionability checks but sends no click.
+        # A known promotion can appear between reading the card and this check.
+        try:
+            for trial in range(2):
+                handle_dialogs(page)
+                if card_state(page, key)["state"] != "offered":
+                    raise AmbiguousResumeError("Offered action changed before click")
+                try:
+                    offered_locator(page, key).click(trial=True, timeout=2500)
+                    handle_dialogs(page)
+                    break
+                except PlaywrightTimeoutError:
+                    if trial:
+                        raise
+                    handle_dialogs(page)
+        except (PlaywrightError, RuntimeError) as exc:
+            safe_failure_artifact(page, "preclick", resume=key)
+            record("resume_unresolved", resume=key, reason="preclick",
+                   error_type=type(exc).__name__)
             unresolved.append(key)
             continue
         CURRENT_STORE.mark_attempt(key)
+        attempted.add(key)
         record("bump_attempt", resume=key)
         try:
             click_bump(page, key)
@@ -693,6 +722,7 @@ def bump(page, *, dry_run=False):
             handle_dialogs(page)
             continue
         CURRENT_STORE.mark_confirmed(key)
+        confirmed_during_cycle.add(key)
         changed += 1
         record("bump_confirmed", resume=key)
         page.wait_for_timeout(700)
@@ -717,6 +747,10 @@ def bump(page, *, dry_run=False):
     for key, state in states.items():
         if state == "cooldown" and CURRENT_STORE.progress(key) and CURRENT_STORE.progress(key)["status"] != "confirmed":
             CURRENT_STORE.mark_confirmed(key)
+            if key in attempted and key not in confirmed_during_cycle:
+                confirmed_during_cycle.add(key)
+                changed += 1
+                record("bump_confirmed", resume=key, via="final_reload")
     remaining = sum(state == "offered" for state in states.values())
     unknown = sum(state == "unknown" for state in states.values())
     unavailable = sum(state == "unavailable" for state in states.values())
@@ -724,10 +758,27 @@ def bump(page, *, dry_run=False):
         state == "unavailable" and CURRENT_STORE.progress(key) is not None and
         CURRENT_STORE.progress(key)["status"] != "confirmed"
         for key, state in states.items())
-    if remaining or unknown or unavailable_pending:
+    protected = [key for key, state in states.items() if state == "offered" and
+                 not CURRENT_STORE.may_send(key)]
+    active_unresolved = [key for key in unresolved if
+                         states[key] == "unknown" or
+                         (states[key] == "offered" and CURRENT_STORE.may_send(key)) or
+                         (states[key] == "unavailable" and
+                          CURRENT_STORE.progress(key) is not None and
+                          CURRENT_STORE.progress(key)["status"] != "confirmed")]
+    deferred_until = min((CURRENT_STORE.progress(key)["not_before"]
+                          for key in protected), default=None)
+    if remaining or unknown or unavailable_pending or active_unresolved:
         record("verification_partial", raised=changed, remaining=remaining,
                unknown=unknown, unavailable=unavailable,
-               unavailable_pending=unavailable_pending, unresolved=len(unresolved))
+               unavailable_pending=unavailable_pending, unresolved=len(active_unresolved),
+               protected=len(protected))
+        if (remaining and remaining == len(protected) and not unknown and
+                not unavailable_pending and not active_unresolved and
+                deferred_until is not None and deferred_until > time.time()):
+            CURRENT_STORE.deferred_until = deferred_until
+            record("cycle_deferred", until=deferred_until, protected=len(protected))
+            return DEFERRED
         return 1
     if code_version() != CODE_VERSION:
         raise GlobalCycleError("Code changed during bump cycle; refusing certification")
@@ -861,9 +912,10 @@ def serve(page):
 
         # A crash at any point after this write cannot cause an immediate resend.
         store.state["last_cycle"] = now
-        store.state["next_due"] = now + INTERVAL
         store.save()
         success = False
+        deferred = False
+        deferred_until = None
         category = "partial"
         try:
             set_stage("navigation")
@@ -879,7 +931,10 @@ def serve(page):
             set_stage("bump")
             result = bump(page)
             success = result == 0
-            if not success:
+            deferred = result == DEFERRED
+            if deferred:
+                deferred_until = store.deferred_until
+            elif not success:
                 safe_failure_artifact(page, "partial_cycle")
                 record("service_cycle_failed", category="partial", error_type="VerificationError")
         except Exception as exc:
@@ -896,6 +951,10 @@ def serve(page):
         if success:
             store.cycle_finished(success=True)
             set_stage("waiting", next_due=store.due_at())
+        elif deferred:
+            store.defer_until(deferred_until)
+            set_stage("deferred_wait", next_due=store.due_at())
+            health_ok = True
         else:
             failures = store.state["failure_count"] + 1
             delay = min(300, 60 * (2 ** min(failures - 1, 3)))
@@ -904,6 +963,8 @@ def serve(page):
             health_ok = False
             next_health_at = time.time() + 60
             if store.state["failure_count"] >= 3:
+                set_stage("stopped", reason="failure_limit",
+                          failure_count=store.state["failure_count"])
                 record("service_stopped", reason="failure_limit",
                        failure_count=store.state["failure_count"])
                 return 1
@@ -973,10 +1034,14 @@ def main():
                             return 2
                     set_stage("check" if args.mode == "check" else "bump")
                     result = bump(page, dry_run=args.mode == "check")
-                    if args.mode == "run":
+                    if args.mode == "run" and result == DEFERRED:
+                        CURRENT_STORE.defer_until(CURRENT_STORE.deferred_until)
+                    elif args.mode == "run":
                         CURRENT_STORE.cycle_finished(success=result == 0,
                             delay=60 if result else None)
-                    set_stage("complete" if result == 0 else "partial", exit_code=result)
+                    set_stage("complete" if result == 0 else
+                              "deferred" if result == DEFERRED else "partial",
+                              exit_code=result)
                     return result
                 if args.mode == "login":
                     record("waiting_for_login", timeout_seconds=900)

@@ -168,10 +168,11 @@ class Store:
     def due_at(self, now=None):
         now = time.time() if now is None else now
         values = [self.state.get("next_due"), self.state.get("recovery_until")]
-        if self.state["last_run"] is not None:
-            values.append(self.state["last_run"] + self.interval)
-        if self.state["next_due"] is None and self.state["last_cycle"] is not None:
-            values.append(self.state["last_cycle"] + self.interval)
+        if self.state["next_due"] is None:
+            if self.state["last_run"] is not None:
+                values.append(self.state["last_run"] + self.interval)
+            if self.state["last_cycle"] is not None:
+                values.append(self.state["last_cycle"] + self.interval)
         return max((value for value in values if value is not None), default=now)
 
     def set_baseline(self, keys):
@@ -219,4 +220,14 @@ class Store:
         self.state["next_due"] = now + (self.interval if delay is None else delay)
         if success:
             self.state["last_run"] = now
+        self.save()
+
+    def defer_until(self, deadline, now=None):
+        """Wait for an already protected resume without treating it as a failed run."""
+        now = time.time() if now is None else now
+        if (not isinstance(deadline, (int, float)) or isinstance(deadline, bool)
+                or not math.isfinite(deadline) or deadline <= 0):
+            raise ValueError("invalid deferred deadline")
+        self.state["failure_count"] = 0
+        self.state["next_due"] = max(deadline, now + 1)
         self.save()

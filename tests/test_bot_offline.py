@@ -6,6 +6,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -278,6 +279,27 @@ class BrowserFixture(unittest.TestCase):
             with self.assertRaises(hh_bump.GlobalCycleError):
                 hh_bump.handle_dialogs(self.page)
 
+    def test_nested_pro_and_animated_setka_use_semantic_dialog(self):
+        self.page.set_content('''<div style="position:fixed;inset:0">
+            <div role="alertdialog" aria-modal="true"><div class="popup">
+            <h2>hh PRO:</h2><button aria-label="Закрыть"
+            onclick="this.closest('[role=alertdialog]').remove()">×</button>
+            <button>Подключить hh PRO</button></div></div></div>''')
+        with patch.object(hh_bump, "is_hh_url", return_value=True), \
+             patch.object(hh_bump, "record"):
+            hh_bump.handle_dialogs(self.page)
+        self.assertEqual(self.page.locator('[role="alertdialog"]').count(), 0)
+
+        self.page.set_content('''<div role="alertdialog" aria-modal="true">
+            <div class="popup"><h2>Сетка</h2>
+            <button id="later" disabled onclick="this.closest('[role=alertdialog]').remove()">Потом</button>
+            <button id="buy">Разместить</button></div></div>''')
+        self.page.evaluate("setTimeout(() => document.querySelector('#later').disabled = false, 350)")
+        with patch.object(hh_bump, "is_hh_url", return_value=True), \
+             patch.object(hh_bump, "record"):
+            hh_bump.handle_dialogs(self.page)
+        self.assertEqual(self.page.locator('[role="alertdialog"]').count(), 0)
+
     def test_partial_cycle_persists_ambiguous_and_never_resends(self):
         server = {A: "offered", B: "offered"}
         clicks = {A: 0, B: 0}
@@ -322,11 +344,88 @@ class BrowserFixture(unittest.TestCase):
             with patch.object(hh_bump, "STATE", state_dir), \
                  patch.object(hh_bump, "CURRENT_STORE", store), \
                  patch.object(hh_bump, "wait_for_bump_confirmation", side_effect=wait_result):
-                self.assertEqual(hh_bump.bump(self.page), 1)
+                self.assertEqual(hh_bump.bump(self.page), hh_bump.DEFERRED)
                 self.assertEqual(store.progress(B)["status"], "ambiguous")
                 self.assertFalse(store.may_send(B))
-                self.assertEqual(hh_bump.bump(self.page), 1)
+                self.assertEqual(hh_bump.bump(self.page), hh_bump.DEFERRED)
             self.assertEqual(clicks, {A: 1, B: 1})
+
+    def test_ambiguous_click_confirmed_by_final_reload_is_success(self):
+        control = ('<button data-qa="resume-update-button" '
+                   'onclick="this.outerHTML=\'<div>Поднять в 12:34</div>\'">'
+                   'Поднять в поиске</button>')
+        self.page.set_content(card(A, control))
+        with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent) as state_dir:
+            state_dir = Path(state_dir)
+            store = Store(state_dir, hh_bump.INTERVAL)
+            store.set_baseline([A])
+            with patch.object(hh_bump, "STATE", state_dir), \
+                 patch.object(hh_bump, "CURRENT_STORE", store), \
+                 patch.object(hh_bump, "is_hh_url", return_value=True), \
+                 patch.object(hh_bump, "is_profile_url", return_value=True), \
+                 patch.object(self.page, "reload"), \
+                 patch.object(hh_bump, "wait_for_bump_confirmation",
+                              side_effect=hh_bump.AmbiguousResumeError("uncertain")):
+                self.assertEqual(hh_bump.bump(self.page), 0)
+                self.assertEqual(store.progress(A)["status"], "confirmed")
+                marker = json.loads((state_dir / "live-verified.json").read_text())
+                self.assertEqual(marker["validation"], "run")
+                self.assertEqual(marker["raised"], 1)
+
+    def test_protected_offer_defers_without_failure_or_full_run_marker(self):
+        self.page.set_content(card(A, OFFERED) + card(B, COOLDOWN_NO_QA))
+        with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent) as state_dir:
+            state_dir = Path(state_dir)
+            store = Store(state_dir, hh_bump.INTERVAL)
+            store.set_baseline([A, B])
+            store.mark_attempt(A)
+            store.mark_ambiguous(A)
+            deadline = store.progress(A)["not_before"]
+            with patch.object(hh_bump, "STATE", state_dir), \
+                 patch.object(hh_bump, "CURRENT_STORE", store), \
+                 patch.object(hh_bump, "is_hh_url", return_value=True), \
+                 patch.object(hh_bump, "is_profile_url", return_value=True), \
+                 patch.object(self.page, "reload"), \
+                 patch.object(hh_bump, "record") as events:
+                self.assertEqual(hh_bump.bump(self.page), hh_bump.DEFERRED)
+                self.assertEqual(store.deferred_until, deadline)
+                self.assertEqual(store.progress(A)["status"], "ambiguous")
+                self.assertFalse((state_dir / "live-verified.json").exists())
+                self.assertFalse((state_dir / "last-run.json").exists())
+                self.assertFalse(any(call.args == ("bump_attempt",)
+                                     for call in events.call_args_list))
+                store.state["failure_count"] = 2
+                store.defer_until(store.deferred_until)
+                self.assertEqual(store.state["failure_count"], 0)
+                self.assertEqual(store.state["last_run"], None)
+                self.assertEqual(store.due_at(), deadline)
+                self.assertEqual(hh_bump.bump(self.page, dry_run=True), 0)
+
+            restarted = Store(state_dir, hh_bump.INTERVAL)
+            self.assertEqual(restarted.due_at(), deadline)
+            self.assertFalse(restarted.may_send(A))
+
+    def test_unprotected_preclick_failure_stays_real_failure(self):
+        self.page.set_content(card(A, OFFERED))
+        with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent) as state_dir:
+            state_dir = Path(state_dir)
+            store = Store(state_dir, hh_bump.INTERVAL)
+            store.set_baseline([A])
+
+            class BlockedAction:
+                def click(self, **kwargs):
+                    raise hh_bump.PlaywrightTimeoutError("actionability timeout")
+
+            with patch.object(hh_bump, "STATE", state_dir), \
+                 patch.object(hh_bump, "CURRENT_STORE", store), \
+                 patch.object(hh_bump, "is_hh_url", return_value=True), \
+                 patch.object(hh_bump, "is_profile_url", return_value=True), \
+                 patch.object(hh_bump, "offered_locator", return_value=BlockedAction()), \
+                 patch.object(self.page, "reload"), \
+                 patch.object(hh_bump, "record"):
+                self.assertEqual(hh_bump.bump(self.page), 1)
+                self.assertIsNone(store.progress(A))
+                self.assertFalse((state_dir / "live-verified.json").exists())
 
 
 class StateFixture(unittest.TestCase):
@@ -349,6 +448,19 @@ class StateFixture(unittest.TestCase):
         self.assertFalse(restarted.account_matches(["c" * 40]))
         restarted.mark_confirmed(A, now=1100)
         self.assertEqual(Store(self.path, 14460, now=1200).progress(A)["status"], "confirmed")
+
+    def test_explicit_deferred_due_survives_newer_last_run_and_restart(self):
+        now = time.time()
+        store = Store(self.path, 14460)
+        store.mark_attempt(A, now=now - 1800)
+        store.mark_ambiguous(A)
+        deadline = store.progress(A)["not_before"]
+        store.state["last_run"] = now - 10
+        store.defer_until(deadline)
+        self.assertEqual(store.due_at(), deadline)
+        restarted = Store(self.path, 14460)
+        self.assertEqual(restarted.due_at(), deadline)
+        self.assertFalse(restarted.may_send(A))
 
     def test_corrupt_state_quarantined_once(self):
         path = self.path / "runtime-state.json"
@@ -479,6 +591,61 @@ class StateFixture(unittest.TestCase):
         self.assertEqual(events.count("service_waiting"), 1)
         self.assertIn("needs_attention", stages)
         bumped.assert_not_called()
+
+    def test_service_defers_protected_offer_without_failure_limit(self):
+        class Page:
+            waits = 0
+            url = "https://ekaterinburg.hh.ru/applicant/profile/me"
+
+            def is_closed(self):
+                return self.waits > 0
+
+            def goto(self, *args, **kwargs):
+                pass
+
+            def wait_for_timeout(self, milliseconds):
+                self.waits += 1
+
+        class FakeStore:
+            def __init__(self):
+                self.state = {"last_run": None, "last_cycle": None,
+                              "next_due": None, "failure_count": 2}
+                self.deferred_until = None
+                self.finished = False
+
+            def due_at(self, now=None):
+                return self.state["next_due"] or time.time() - 1
+
+            def save(self):
+                pass
+
+            def defer_until(self, deadline):
+                self.state["next_due"] = deadline
+                self.state["failure_count"] = 0
+
+            def cycle_finished(self, **kwargs):
+                self.finished = True
+
+        store = FakeStore()
+
+        def protected_only(_page):
+            store.deferred_until = time.time() + 3600
+            return hh_bump.DEFERRED
+
+        with patch.object(hh_bump, "CURRENT_STORE", store), \
+             patch.object(hh_bump, "set_stage"), \
+             patch.object(hh_bump, "record"), \
+             patch.object(hh_bump, "service_health"), \
+             patch.object(hh_bump, "dismiss_cookie_notice"), \
+             patch.object(hh_bump, "wait_for_cookie_notice"), \
+             patch.object(hh_bump, "login_page", return_value=False), \
+             patch.object(hh_bump, "is_hh_url", return_value=True), \
+             patch.object(hh_bump, "bump", side_effect=protected_only):
+            self.assertEqual(hh_bump.serve(Page()), 0)
+        self.assertEqual(store.state["failure_count"], 0)
+        self.assertEqual(store.state["last_run"], None)
+        self.assertFalse(store.finished)
+        self.assertGreater(store.state["next_due"], time.time() + 3500)
 
 
 if __name__ == "__main__":

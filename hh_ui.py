@@ -11,11 +11,19 @@ from hh_state import RESUME_ID
 # narrow viewports without classifying ordinary positioned card controls as dialogs.
 MODAL_TEST_JS = r"""
 const isModal = node => {
+    if (node === document.documentElement || node === document.body) return false;
     const style = window.getComputedStyle(node);
     if (node.getClientRects().length === 0 || style.display === 'none' ||
         style.visibility === 'hidden' || style.visibility === 'collapse') return false;
-    if (node.tagName === 'DIALOG' || node.getAttribute('role') === 'dialog' ||
+    if (node.tagName === 'DIALOG' || ['dialog', 'alertdialog'].includes(node.getAttribute('role')) ||
         node.getAttribute('aria-modal') === 'true') return true;
+    // A semantic dialog owns its contents; neither its wrapper nor a nested
+    // class="popup" should be counted as another, competing modal.
+    if (node.closest('dialog, [role="dialog"], [role="alertdialog"], [aria-modal="true"]') !== null &&
+        node.closest('dialog, [role="dialog"], [role="alertdialog"], [aria-modal="true"]') !== node)
+        return false;
+    if (node.querySelector('dialog, [role="dialog"], [role="alertdialog"], [aria-modal="true"]'))
+        return false;
     const marker = [node.id, typeof node.className === 'string' ? node.className : '',
         node.getAttribute('data-qa') || '']
         .join(' ').toLowerCase();

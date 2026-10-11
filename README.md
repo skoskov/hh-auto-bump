@@ -52,6 +52,9 @@ results are saved per resume. An uncertain action is not automatically resent
 before its protective interval has expired and HH again offers the action.
 Other safely identified cards can still be processed after a local card error.
 Account changes, an unexpected host or an unknown blocking dialog stop the cycle.
+An offered control protected by a local deadline is deferred, not a new failure.
+The service waits for the earliest deferred deadline without certifying a full
+successful bump cycle or extending the protection interval.
 
 Successful cycles are separated by at least four hours and one minute. Temporary
 failures use bounded short retries; per-resume deadlines still prevent duplicate
@@ -82,8 +85,15 @@ run levels. Updates replace the former repeating trigger with a logon trigger.
 Only the service owns resume periodicity; Task Scheduler starts it when the user
 logs on and can restart a failed process up to three times at one-minute intervals.
 The process has no execution time limit; `IgnoreNew` prevents duplicate launches.
-No installation immediately starts a live cycle. Start the service manually once
-in the current desktop session. Scheduler failures never wait for keyboard input.
+No installation immediately starts a live cycle. To start the installed task in
+the current desktop session with process supervision:
+
+```powershell
+Start-ScheduledTask -TaskName 'HH-Resume-AutoBump' -TaskPath '\'
+```
+
+A direct `run-scheduled.ps1` invocation is a manual process and is not supervised
+by Task Scheduler. Scheduler failures never wait for keyboard input.
 
 After repeated failures, inspect status and failure artifacts. Automatic process
 restarts are bounded; after the supervisor's restart limit, manual intervention
